@@ -1,0 +1,207 @@
+---
+title: "Diggins & Serti - JCI Insight - Figures 4 and 5"
+output: html_notebook
+author: "Kirsten Diggins"
+---
+
+This code was used to generate volcano plots and barcode enrichment plots for Figures 4 and 5 of Diggins & Serti et al, "Exhausted-like CD8 T cell phenotypes linked to C-peptide preservation in alefacept-treated T1D subjects."
+
+RNAseq data and description for these data can be found at: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE163731
+All code and associated files can be found at: https://github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020
+
+## Load and process data
+
+```{r load_pckgs, message=FALSE, warning=FALSE}
+## Load counts and annotation
+
+library(plyr)
+library(ggplot2); theme_set(theme_bw(20) + theme(panel.grid.major = element_blank(), 
+                                                 panel.grid.minor = element_blank()))
+library(edgeR)
+library(readxl)
+library(GEOquery)
+library(RCurl)
+library(gplots)
+library(ggthemes)
+library(RColorBrewer)
+library(raster)
+library(dplyr)
+library(data.table)
+library(viridis)
+library(WGCNA)
+library(ggrepel)
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r load_counts_and_anno}
+# Get GEO counts data
+GEO_data <- getGEOSuppFiles('GSE163731')
+all_counts_data <- read.csv(gzfile(paste(row.names(GEO_data))))
+
+counts <- all_counts_data[,-1]
+row.names(counts) <- all_counts_data[,1]
+
+## Reformat library names
+colnames(counts) <- colnames(counts) %>%
+  strsplit("_") %>%
+  sapply("[",1)
+
+## Load QC metrics and annotation
+anno_and_metrics <- read.csv(text = getURL("https://raw.github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020/master/Diggins and Serti - JCI Insight - Figure 4 RNAseq annotations.csv"))
+
+## Split out population names into discrete designations:
+anno_and_metrics$Cell.Pop <- anno_and_metrics$sample.sampleName %>%
+  strsplit("-") %>%
+  sapply("[",2)
+
+
+## Load gene lists
+blue_mod <- read.csv(text = getURL("https://raw.github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020/master/blue module gene list.csv"))
+telomere_genes <- read.csv(text = getURL("https://raw.github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020/master/telomere gene list.csv"))
+
+## Specify gene_set to use in barcode plot downstream
+gene_set = blue_mod
+
+```
+
+### Run QC on raw counts and format data for downstream analysis
+
+```{r filter_libs, message=FALSE, warning=FALSE}
+## Filter libraries based on QC thresholds
+KeepMetrics = subset(anno_and_metrics, anno_and_metrics$fastq_total_reads > 3*10^6 &
+                       anno_and_metrics$median_cv_coverage <0.6 & 
+                       anno_and_metrics$mapped_reads_w_dups > 0.75) 
+
+#Remove libraries from counts data that fail QC cuts
+KeepCols <- which(colnames(counts) %in% KeepMetrics$Lib.ID)
+CountsQC <- counts[, KeepCols]
+post_QC_counts <- CountsQC
+row.names(post_QC_counts) <- row.names(counts)
+```
+
+```{r get_gene_symbols}
+#Keep protein coding genes with HGNC symbols
+geneKey <- read.table(text = getURL("https://raw.github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020/master/blue module gene list.csv"),header = TRUE,sep = "\t",na.strings = "")
+
+genesWithHGNC <- geneKey[!is.na(geneKey$HGNC.symbol),]
+pcGenes <- subset(genesWithHGNC, genesWithHGNC$Gene.type == "protein_coding")
+pcGenes <- pcGenes[!duplicated(pcGenes$Ensembl.Gene.ID),] #remove duplicated ensembl genes
+
+post_QC_counts <- merge(pcGenes, post_QC_counts, by.x="Ensembl.Gene.ID", by.y ="row.names")
+
+#Average counts for duplicated HGNC symbols
+rownames(post_QC_counts) <- post_QC_counts$Ensembl.Gene.ID
+
+post_QC_counts <- aggregate(post_QC_counts[,-c(1:3)], list(post_QC_counts$HGNC.symbol), mean) #will produce warnings when it tries to average names, ignore these
+rownames(post_QC_counts) <- post_QC_counts$Group.1
+post_QC_counts <- post_QC_counts[,-1]
+```
+
+```{r filter_and_norm_counts}
+# Filter out libraries from annotation data that were removed during QC
+filtered_all_annotation <- anno_and_metrics[anno_and_metrics$Lib.ID %in% colnames(post_QC_counts),]
+
+##### Normalize counts data #####
+
+libsize_norm_factors <- colSums(post_QC_counts)/(10^6)
+counts_libsize_norm <- as.data.frame(t(t(post_QC_counts)/libsize_norm_factors))
+
+#Filter to keep genes that have a count of at least one in 10% of libraries
+keepRows <- rowSums((counts_libsize_norm) >= 1) >= 0.10*ncol(counts_libsize_norm)
+post_QC_counts <- post_QC_counts[keepRows,]
+
+# Order annotation by libID
+
+ordered_annotations <- filtered_all_annotation[match(colnames(post_QC_counts),filtered_all_annotation$Lib.ID), ]
+
+raw_counts <- post_QC_counts
+
+# Make DGEList and apply TMM normalization 
+DGEcounts <- DGEList(counts = raw_counts)
+DGEcounts <- calcNormFactors(DGEcounts) #TMM default
+```
+
+
+## Run limma 
+
+```{r contrast_cell_subset_using_limma}
+order_anno <- KeepMetrics[match(colnames(DGEcounts),KeepMetrics$Lib.ID),]
+
+Design <- model.matrix(~0 + order_anno$Cell.Pop + order_anno$algn_seg_with_mult_algn)
+colnames(Design) <- c("CD57neg","CD57pos","DN","DP","PD1neg","PD1pos","mult_align")
+contrast_matrix <- makeContrasts(CD57pos - PD1pos,levels=Design)
+
+DesignVoom <- voomWithQualityWeights(DGEcounts, design = Design,
+                                     plot = F)
+
+## Fit model 
+corfit <- duplicateCorrelation(object = DesignVoom, design = Design, block=order_anno$Donor.ID, ndups = 3)
+DesignVoom <- voomWithQualityWeights(DGEcounts, design = Design,
+                                     plot = F,
+                    block = order_anno$Donor.ID, correlation = corfit$consensus)
+
+dataFit <- lmFit(DesignVoom, Design , block = order_anno$Donor.ID, correlation = corfit$consensus)
+dataFit <- contrasts.fit(dataFit, contrasts = contrast_matrix)
+dataFit <- eBayes(dataFit)
+dataResults <- topTable(dataFit, number = nrow(DGEcounts))
+
+# Get significant genes
+sig_genes <- dataResults[c(dataResults$adj.P.Val < 0.05 & dataResults$logFC > 1),]
+```
+
+## Get volcano plots
+
+```{r volcano_plots, fig.width=5, fig.height=5}
+# theme_set(theme_bw(44) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+theme_set(theme_classic())
+update_geom_defaults("point", aes(size = 5))
+labGenes <- c("CD28","PDCD1","CD27","IL2","KIR3DL2","KIR2DL3","KIR2DL4","KIR3DL1","LILRB1","KLRD1","TIGIT","EOMES","KLRG1","CTLA4")
+
+genes_up <- row.names(dataResults[c(dataResults$adj.P.Val < 0.1 & dataResults$logFC > 1),])
+genes_down <- row.names(dataResults[c(dataResults$adj.P.Val < 0.1 & dataResults$logFC < -1),])
+genes_up_or_down <- c(genes_up,genes_down)
+
+to.plot <- dataResults
+to.plot.sub1 = subset(to.plot, row.names(to.plot) %in% genes_up)
+to.plot.sub2 = subset(to.plot, row.names(to.plot) %in% genes_down)
+to.plot.sub3 = subset(to.plot, row.names(to.plot) %in% labGenes & !(row.names(to.plot) %in% genes_up_or_down))
+to.plot.sub = rbind(to.plot.sub1, to.plot.sub2,to.plot.sub3)
+
+fdr = 1 # 0.699
+up.col = c("#ca0020")
+dn.col = c("#0571b0")
+neutral.col = "grey25"
+
+tLabs = subset(to.plot.sub, row.names(to.plot.sub) %in% labGenes)
+tLabs = data.frame(symbol = row.names(tLabs), tLabs)
+
+ggplot(to.plot, aes(x = logFC, y = -log10(adj.P.Val))) + geom_point(colour = "grey") +
+  geom_point(data = to.plot.sub1, colour = up.col, alpha = 0.3) +
+  geom_point(data = to.plot.sub2, colour = dn.col, alpha = 0.3)+
+  geom_point(data = to.plot.sub3, colour = neutral.col, alpha = 0.3) +
+  labs(x = "logFC", y = "-log10(FDR)") +
+  geom_hline(yintercept = fdr, linetype = "dotted", size = 0.5) +
+  geom_vline(xintercept = -1, linetype = "dotted", size = 0.5) + geom_vline(xintercept = 1, linetype = "dotted", size = 0.5) +
+  geom_text_repel(aes(label = symbol), data = tLabs, size = 4, arrow = arrow(length = unit(0.01, "npc")),box.padding = 0.5) +
+  theme(axis.title = element_text(size=18),
+        axis.text = element_text(size=18),
+        aspect.ratio = 1) 
+```
+
+##Get barcode plot of gene set enrichment
+
+```{r barcode_plot}
+gene_index = row.names(dataFit$t) %in% gene_set
+barcodeplot(dataFit$t[,1],index=gene_index)
+```
+
+## Run roast on gene set for stats
+
+```{r roast_for_enrichment_stats}
+roast_result <- roast(y = DesignVoom, index = row.names(DesignVoom$E) %in% gene_set, design=Design, contrast=contrast_matrix, set.statistic="mean",approx.zscore=F)
+
+roast_result$p.value
+```
+
+

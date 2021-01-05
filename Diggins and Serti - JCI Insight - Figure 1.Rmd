@@ -1,0 +1,353 @@
+---
+title: "Diggins & Serti - JCI Insight - Figure 1"
+output: html_notebook
+author: "Kirsten Diggins"
+---
+
+This code was used to generate panels in Figure 1 of Diggins & Serti et al, "Exhausted-like CD8 T cell phenotypes linked to C-peptide preservation in alefacept-treated T1D subjects."
+
+RNAseq data and description can be found at: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE158292
+All code and associated files can be found at: https://github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020
+
+## Load and process data
+
+```{r load_data_and_pckgs}
+## Load counts and annotation
+
+# Read and combine flow cell counts and QC metrics
+library(plyr)
+library(ggplot2); theme_set(theme_bw(20) + theme(panel.grid.major = element_blank(), 
+                                                 panel.grid.minor = element_blank()))
+library(edgeR)
+library(readxl)
+library(GEOquery)
+library(RCurl)
+library(gplots)
+library(ggthemes)
+library(RColorBrewer)
+library(raster)
+library(dplyr)
+library(data.table)
+library(viridis)
+library(WGCNA)
+
+options(stringsAsFactors = FALSE)
+
+# Get GEO counts data
+GEO_data <- getGEOSuppFiles('GSE158292')
+all_counts_data <- read.csv(gzfile(paste(row.names(GEO_data))))
+
+counts <- all_counts_data[,-1]
+row.names(counts) <- all_counts_data[,1]
+DGEcounts <- DGEList(counts = counts)
+DGEcounts <- calcNormFactors(DGEcounts) #TMM default
+
+## Load QC metrics and annotation
+anno_and_metrics <- read.csv(text = getURL("https://raw.github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020/master/T1DAL RNAseq annotation and metrics.csv"))
+```
+
+```{r}
+# Subset annotations to include CD8 and visit.
+keep_week = 104
+annotation_data <- dplyr::filter(anno_and_metrics, week==keep_week)
+```
+
+```{r}
+DGEcounts_normed <- log2(cpm(DGEcounts$counts)+1)
+
+# Subset counts according to Lib.ID
+DGEcounts_subset <- DGEcounts[,colnames(DGEcounts$counts) %in% annotation_data$Lib.ID]
+annotation_data$Responder.Type <- factor(annotation_data$Responder.Type)
+annotation_data$cell.type <- factor(annotation_data$cell.type)
+```
+
+```{r}
+annotation_data_ordered <- annotation_data[match(colnames(DGEcounts_subset$counts),annotation_data$Lib.ID),]
+
+design <- annotation_data_ordered
+design_matrix <- model.matrix(~0 + design$Responder.Type + design$MEDIAN_CV_COVERAGE + design$age)
+vwts <- voomWithQualityWeights(DGEcounts_subset, design=design_matrix, plot=FALSE, span=0.1)
+
+# design_batches = variation to preserve
+design_batches <- model.matrix(~0 + design$Responder.Type)
+
+# In the removeBatchEffect call, use covariates call for numeric variables, batch call for categorical variables
+
+counts_bc_subset <- removeBatchEffect(vwts$E, covariates = cbind(design$MEDIAN_CV_COVERAGE,design$age), design = design_batches)
+```
+
+## WGCNA
+
+Run WGCNA on corrected counts. Subset to include top 5K most variable genes and then reorder data for WGCNA.
+
+```{r}
+datExpr_all <- t(counts_bc_subset)
+# datExpr_all <- t(voom(DGEcounts_subset)$E)
+cv.function <- function(x){
+  cv_val <- sd(x)/mean(x)
+  return(cv_val)
+}
+## Get most variable transcripts
+transcript_cvs <- apply(datExpr_all, 2, cv.function)
+ordered_cvs <- transcript_cvs[order(abs(transcript_cvs),decreasing = TRUE)]
+top_cv_transcripts <- names(ordered_cvs[1:5000])
+
+datExpr <- datExpr_all[,c(top_cv_transcripts)]
+```
+
+```{r}
+# Make sure datExpr and datTraits are in same lib order
+annotations_ordered <- annotation_data[match(row.names(datExpr),annotation_data$Lib.ID),]
+
+datTraits <- dplyr::select(annotations_ordered, MEDIAN_CV_COVERAGE, PCT_CODING_BASES, age, rate_of_cpeptide_change_random_effect)
+```
+
+Calculate soft thresholding power. 
+
+```{r, fig.width=14, message=FALSE, warning=FALSE, results="hide"}
+##### Calculate soft thresholding power #####
+powers = c(c(1:30), seq(from = 12, to = 20, by = 2))
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 0)
+```
+
+```{r, fig.width=14, message=FALSE, warning=FALSE}
+par(mfrow = c(1,2))
+cex1 = 0.9
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")
+abline(h=0.90,col="red")
+
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+```
+
+```{r}
+# One-step network construction and module detection #####
+net = blockwiseModules(datExpr, power = 5,
+                       TOMType = "signed", networkType = "signed", minModuleSize = 50, 
+                       maxBlockSize = 24000,reassignThreshold = 0, mergeCutHeight = 0.3,
+                       numericLabels = TRUE, pamRespectsDendro = FALSE,
+                       verbose = 1)
+
+
+table(net$colors)
+mergedColors = labels2colors(net$colors)
+```
+
+## Figure 1B
+```{r}
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.2,
+                    addGuide = T, guideHang = 0.2,
+                    colorHeight = 0.8
+                    )
+```
+
+```{r}
+## Cluster modules on their eigengenes --> visualize clusters in dendrogram
+test_denro = net$dendrograms
+```
+
+```{r}
+# Define numbers of genes and samples
+# datExpr_subset <- datExpr[match(annotations_ordered_subset$Lib.ID,row.names(datExpr)),]
+datExpr_subset <- datExpr
+nGenes = ncol(datExpr_subset)
+nSamples = nrow(datExpr_subset)
+
+# Recalculate MEs with color labels (ME = module eigengenes)
+MEs0 = moduleEigengenes(datExpr_subset, mergedColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = round(cor(MEs[-4,], datTraits[-4,], use = "p"),2)[,-2]
+moduleTraitPvalue = round(corPvalueStudent(moduleTraitCor, nSamples),4)
+
+colnames(moduleTraitCor) <- c("QC", "Age", "C-peptide change")
+colnames(moduleTraitPvalue) <- c("QC", "Age", "C-peptide change")
+
+### Plot correlation heatmaps with ggplot
+
+# Reformat pval and correlation matrices
+modTraitPval_format <- reshape2::melt(moduleTraitPvalue,id.vars = "Module")
+modTraitCor_format <- reshape2::melt(moduleTraitCor,id.vars = "Module")
+
+names(modTraitPval_format) <- c("Module","Trait","Pval")
+names(modTraitCor_format) <- c("Module","Trait","Cor")
+```
+
+## Figure 1C
+
+```{r}
+plot_cor <- as.data.frame(moduleTraitCor) %>%
+  mutate(Color=row.names(.)) %>%
+  # dplyr::filter(Color != "MEgrey") %>% 
+  dplyr::rename(C.Peptide.Change="C-peptide change")
+  
+  ggplot(plot_cor,aes(x=as.factor(Color),y=C.Peptide.Change)) +
+  geom_col(fill="darkgray") +
+  theme_classic() +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype="dotted", 
+             color = "black") +
+  xlab("Module") + ylab("Correlation with C-peptide Change") +
+  theme(axis.title = element_text(size=18),
+        axis.text = element_text(size=18), 
+        axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0)), 
+        axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0)), 
+        aspect.ratio = 1)
+```
+
+## Figure 1D
+
+Correlation plots for modules and clinical variables.
+```{r message=FALSE, warning=FALSE}
+cpept_eigengene <- data.frame(C.peptide.change = datTraits$rate_of_cpeptide_change_random_effect,Blue.mod = MEs$MEblue, Age=datTraits$age,Red.mod=MEs$MEred,Yellow.mod=MEs$MEyellow)
+x.axis = "Blue.mod"
+y.axis = "C.peptide.change"
+# 
+x = cpept_eigengene[,x.axis]
+y = cpept_eigengene[,y.axis]
+
+myformula <- x ~ y
+R = round(cor(as.numeric(as.character(x)),as.numeric(as.character(y)),use="complete.obs"),2)
+data.lm <- lm(as.numeric(as.character(x))~as.numeric(as.character(y)),data=cpept_eigengene)
+# summary(data.lm)
+
+rSquared <- round(summary(data.lm)$r.squared,2)
+pVal <- formatC(anova(data.lm)$'Pr(>F)'[1],format="e",digits=2)
+
+## Use cor.test to get test that correlation is significantly different from 0; use spearman
+cor_p_val <- cor.test(x,y,method = "pearson")
+
+## Plot correlation
+ggplot(cpept_eigengene, aes(x = as.numeric(as.character(x)), y = as.numeric(as.character(y)))) +
+  geom_point(size=5) + 
+  theme_classic() +
+  labs(x = paste(x.axis) , y = paste(y.axis)) +
+  ggtitle(paste("R=",R,", p=",pVal,sep=" ")) +
+  theme(title=element_text(size=15), 
+        axis.title = element_text(size=18),
+        axis.text = element_text(size=18), 
+        axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0)), 
+        axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0)), 
+        aspect.ratio = 1)+ 
+  geom_smooth(method="lm")
+```
+
+## Figure 1F
+
+```{r}
+# Get gene list from module
+
+intModule = "blue"
+allLLIDs <- colnames(datExpr)
+modGenes = (mergedColors==intModule)
+
+# Get gene names
+modLLIDs = allLLIDs[modGenes];
+module_genes <- as.matrix(modLLIDs)
+
+```
+
+Enrichment analysis of interesting modules with goana.  
+
+```{r, message=FALSE, warning= FALSE, results='hide'}
+library(org.Hs.eg.db) #loading this library before running WGCNA causes errors
+```
+
+```{r, message=FALSE, warning= FALSE}
+T1DAL_bkgr_genes <- row.names(counts)
+
+allT1DAL_genes_entrez <- select(org.Hs.eg.db,keys=T1DAL_bkgr_genes,columns=c("GENENAME","ENTREZID"),keytype="SYMBOL")
+
+### Get gene list
+module_genes = module_genes
+mod_genes_entrez <- select(org.Hs.eg.db,keys=module_genes,columns=c("GENENAME","ENTREZID"),keytype="SYMBOL")
+
+goana_results <- goana(mod_genes_entrez$ENTREZID,FDR=0.05)
+# goana_results <- goana(mod_genes_entrez$ENTREZID,FDR=0.05,universe=allT1DAL_genes_entrez$ENTREZID,trend=T)
+
+goana_sig <- goana_results[goana_results$P.DE<=0.01,]
+order_goana_sig <- goana_sig[order(goana_sig$P.DE,decreasing=FALSE),]
+order_goana_sig <- cbind(order_goana_sig,c(1:nrow(order_goana_sig)))
+order_goana_sig_smallN <- order_goana_sig[order_goana_sig$N < 100,]
+# head(paste(row.names(order_goana_sig),order_goana_sig$Term,sep=" "),n=30)
+head(order_goana_sig[grep("cytotoxicity",goana_sig$Term),],n=15)
+
+# head(order_goana_sig,n=50)
+```
+
+Plot GO terms FDR.
+
+```{r}
+plot_go_terms_results <- order_goana_sig
+to.plot = data.frame(term_id = row.names(plot_go_terms_results), term_description = plot_go_terms_results$Term, pvalue_fdr = plot_go_terms_results$P.DE)
+to.plot$names = paste(to.plot$term_id,"\n", to.plot$term_description, sep = "")
+to.plot_ordered <- to.plot[order(as.numeric(to.plot$pvalue_fdr),decreasing = F),]
+
+keep_terms = c("GO:0001909","GO:0042098","GO:0050900","GO:0045580","GO:0045321","GO:0006955")
+to.plot_subset <- to.plot_ordered[to.plot_ordered$term_id %in% keep_terms,]
+
+ggplot(to.plot_subset, aes(x = reorder(names,-pvalue_fdr), y = -log10(pvalue_fdr))) +
+  geom_bar(stat="identity",show.legend=T) +
+  theme(legend.text = element_text(size = 250)) +
+  theme_classic() + 
+  geom_hline(yintercept = 1.3, lty = "dotted") +
+  xlab("") + ylab("-log10(FDR)") +
+  # labs(x = xlab, y = ylab) +
+  theme(axis.title.x = element_text(size=25),axis.text.x = element_text(size=20),axis.text.y = element_text(size=20)) +
+  coord_flip()
+```
+
+## Figure 1E
+
+```{r}
+blue_mod_medians <- read.csv(text = getURL("https://raw.github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020/master/RNAseq all blue mod medians per subject and week.csv"))
+CD8_annotation <- anno_and_metrics 
+
+all_data_merge <- merge(blue_mod_medians,CD8_annotation,by=c("Subject.ID","week")) %>%
+  dplyr::filter(Responder.Type!="P")
+
+all_data_merge$Responder.Type <- factor(all_data_merge$Responder.Type)
+
+## Calculate change from baseline medians
+all_data_merge_baseline <- all_data_merge %>%
+  dplyr::filter(week==0) %>%
+  rename(median_count = "Baseline_count") %>%
+  dplyr::select(-Responder.Type,-week)
+
+all_data_merge_change <- all_data_merge %>%
+  merge(all_data_merge_baseline,by="Subject.ID") %>%
+  mutate(Expr.Change = median_count - Baseline_count) 
+
+median_counts_change <- all_data_merge_change %>%
+  dplyr::select(Responder.Type,week,Expr.Change) %>%
+  group_by(Responder.Type,week) %>%
+  summarize(median = median(Expr.Change,na.rm = T), sem = sd(Expr.Change,na.rm = T)/sqrt(length(Expr.Change)),na.rm = T) %>%
+  filter(!is.na(sem))
+
+median_counts <- all_data_merge %>%
+  dplyr::select(Responder.Type,week,median_count) %>%
+  group_by(Responder.Type,week) %>%
+  summarize(median = median(median_count,na.rm = T), sem = sd(median_count,na.rm = T)/sqrt(length(median_count)),na.rm = T) %>%
+  filter(!is.na(sem))
+
+col_pal = c("#68829E", "#598234", "#A43820", "#505160") # yellows: "#F4CC70", "#DE7A22",
+
+ggplot(median_counts_change, aes(x = week, y = median, color = Responder.Type)) +
+  geom_line(size = 1.5) +
+  geom_point(size=3) +
+  geom_errorbar(aes(ymax = median + sem, ymin = median - sem), width = 4) +
+  scale_color_manual(values = col_pal) +
+  labs(y = "Median Blue Mod Gene Expr\nChange from Baseline", x = "Study Week") +
+  theme_classic() +
+  theme(title=element_text(size=12), axis.title.y.left = element_text(size=20), axis.title.x.bottom = element_text(size=20), axis.text = element_text(size=22), axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0)), axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0))) +
+  geom_hline(yintercept=0,linetype="dotted")
+```
