@@ -1,0 +1,179 @@
+---
+title: "Diggins & Serti - JCI Insight - Figure 3"
+output: html_notebook
+author: "Kirsten Diggins"
+---
+
+This code was used to generate tSNE plots and heatmaps for Figure 3 of Diggins & Serti et al, "Exhausted-like CD8 T cell phenotypes linked to C-peptide preservation in alefacept-treated T1D subjects."
+
+FCS files can be found https://www.itntrialshare.org/T1DAL.url. All additional code and annotation files can be found at: https://github.com/BenaroyaResearch/Diggins_Serti_Linsley_JCI_Insight_2020
+
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(flowStats)
+library(flowCore)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(Rtsne)
+library(grid)
+library(viridis)
+library(ggthemes)
+library(dplyr)
+library(reshape2)
+library(ComplexHeatmap)
+
+set.seed(123456)
+```
+
+## Load and process FCS files
+
+```{r load_and_downsample_data, message=FALSE, warning=FALSE}
+cd8_files <- list.files(path=path,pattern = "\\.fcs",recursive=T)
+cd8_fcs <- lapply(paste0(path,cd8_files), read.FCS, transformation = F)
+
+#### Process & transform data ####
+process_data <- function(fcs){
+  
+  # Use marker names instead of dye names
+  colnames(fcs) = make.names(toupper(pData(parameters(fcs))$desc))
+  
+  # Remove markers with multiple markers (i.e. all the NAs)
+  fcs = fcs[,!(duplicated(colnames(fcs)) | duplicated(colnames(fcs), fromLast = T))]
+  
+  fcs = fcs[, order(colnames(fcs))]
+}
+
+cd8_fcs <- lapply(cd8_fcs, process_data)
+
+## Transform the data
+asinh_tfm_data <- function(fcs){
+  # Arcsinh transform remaining columns
+  tl <- transformList(colnames(fcs), arcsinhTransform(a=0, b=1/5), transformationId="asinh")
+  fcs = transform(fcs, tl) 
+}
+
+cd8_arcsinh_trans <- lapply(cd8_fcs, asinh_tfm_data)
+
+#### Extract and merge data (prep for pooled cytofkit analysis) ####
+subjects <- lapply(cd8_arcsinh_trans,identifier) %>%
+  unlist() %>%
+  str_remove(.,".fcs") 
+# subjects <- subjects[49:96]
+
+mergedExpr = setNames(data.frame(matrix(ncol = ncol(exprs(cd8_arcsinh_trans[[1]]))+1, nrow = 0)), c(colnames(cd8_arcsinh_trans), "subj"))
+for(i in 1:length(cd8_arcsinh_trans)){
+  tmp.expr = as.data.frame(exprs(cd8_arcsinh_trans[[i]]))
+  tmp.expr$subj = as.character(subjects[i])
+  mergedExpr = rbind(mergedExpr, tmp.expr)
+}
+
+# Find the lowest number of CD8 events sampled
+min_cd8_events <- min(table(mergedExpr$subj))
+
+# Make a df with the same total number of total CD4 events for each subject (downsample to lowest CD8 level)
+all_events_downsampled <- mergedExpr %>% group_by(subj) %>% do((function(x) {
+  sample_idx <- sample(nrow(x), min_cd8_events)
+  ds_df <- x[sample_idx,]
+  return(ds_df)
+})(.))
+
+```
+
+## tSNE analysis 
+
+```{r run_tSNE}
+all_data_subsample <- all_events_downsampled[sample(row.names(all_events_downsampled),100000,replace=F),]
+
+cluster_markers <- c("CCR7", "CD38", "CXCR3", "CD27", "CD45RA", "CD45RO", "CD57","CD25", "TIGIT","EOMES", "T.BET", "CD95", "HELIOS", "KLRG1", "TIM3","PD1", "CD122", "X24B", "CD161","CD127","NKG2D")
+
+tSNE_results <- Rtsne(all_data_subsample[,cluster_markers], dims=2, initial_dims = length(cluster_markers), check_duplicates = FALSE)
+
+tSNE_coordinates = tSNE_results$Y
+colnames(tSNE_coordinates) <- c("tSNE_1","tSNE_2")
+data_with_tSNE <- cbind(as.data.frame(all_data_subsample),tSNE_coordinates)
+```
+
+## RPhenograph analysis
+
+```{r run_Rphenograph}
+data_to_cluster <- all_data_subsample[,c(cluster_markers)]
+
+phenograph_results <- Rphenograph(data_to_cluster)
+
+data_with_tSNE_and_clusters <- data.frame(data_with_tSNE,Cluster= phenograph_results$membership) 
+```
+
+## Generate Figures
+
+Color points by marker expression:
+
+```{r tSNE_plot_marker_expr}
+data_with_tSNE_and_clusters <- tsne_week104 %>%
+  # filter(Cluster %in% keep_clusts$Cluster)
+  group_by(subj)
+
+ggplot(data=data_with_tSNE_and_clusters,aes(x=tSNE_1,y=tSNE_2,col=as.factor(Cluster))) +
+  geom_point(alpha=0.8) +
+  # scale_color_manual(values=cols,name="Cluster") +
+  # scale_color_viridis_c() +
+  # scale_alpha(range = c(0.00, 0.5), guide = FALSE) +
+  # stat_density2d(aes(alpha=..level..,fill=..level..),size=2,bins=10,geom="polygon") +
+  # geom_density2d(color="black",bins=10) +
+  # ylim(c(-11,11)) + xlim(c(-11,12))+
+  coord_equal() +
+  theme_classic()
+```
+
+Color only selected clusters and make the rest of the points gray:
+
+```{r tSNE_plot_color_clusters}
+### Color only selected clusters and make the rest of the points gray
+cols = c("#FFFF99","#1F78B4","#FB9A99","#FDBF6F","#B2DF8A","#FF7F00","gray","#EF8A62","#CAB2D6","#E31A1C","#E9A3C9","black","#6A3D9A","#A6CEE3","#B15928", "#33A02C")
+
+data_with_tSNE_and_clusters_select <- filter(data_with_tSNE_and_clusters,Cluster %in% c(12,20))
+data_with_tSNE_and_clusters$new_ID <- rep(0,nrow(data_with_tSNE_and_clusters))
+
+data_with_tSNE_and_clusters[!(data_with_tSNE_and_clusters$Cluster %in% c(12,20)),]$new_ID <- 0
+data_with_tSNE_and_clusters[(data_with_tSNE_and_clusters$Cluster %in% c(12)),]$new_ID <- 12
+data_with_tSNE_and_clusters[(data_with_tSNE_and_clusters$Cluster %in% c(20)),]$new_ID <- 20
+
+ggplot(data=data_with_tSNE_and_clusters,aes(x=tSNE_1,y=tSNE_2)) +
+  # geom_point(alpha=1,size=3)+
+  geom_point(data=filter(data_with_tSNE_and_clusters,new_ID!=0),aes(x=tSNE_1,y=tSNE_2,col=as.factor(new_ID)),alpha=0.5,size=3)+
+  scale_color_manual(values=c(cols[6],cols[13]),name="Cluster") +
+  geom_density2d(color="gray27",linemitre=20) +
+  coord_equal() +
+  ylim(c(-11,11)) + xlim(c(-11,12))+
+  theme_classic() 
+```
+
+Get cluster z-score heatmaps:
+
+```{r marker_expr_heatmap}
+plot_markers <- c("CCR7", "CD38", "CXCR3", "CD27", "CD45RA", "CD45RO", "CD57","CD25", "TIGIT","EOMES", "T.BET", "CD95", "HELIOS", "KLRG1", "TIM3","PD1", "CD122", "X24B", "CD161","CD127","NKG2D","GRZMB")
+data_with_tSNE_and_clusters <- as.data.frame(data_with_tSNE_and_clusters)
+cluster_medians <- stats::aggregate(. ~ data_with_tSNE_and_clusters$Cluster, data = data_with_tSNE_and_clusters[,c(plot_markers)], median) %>%
+  dplyr::rename(Cluster = "data_with_tSNE_and_clusters$Cluster",`24B`= "X24B")
+
+keep_clusts <- c(2,3,5,9,11,12,13,14,15,16,17,19,20,21,22,23)
+
+cluster_medians <- cluster_medians %>%
+  dplyr::filter(Cluster %in% keep_clusts)
+
+col_scaled_median_RP <- scale(cluster_medians)
+row.names(col_scaled_median_RP) <- cluster_medians$Cluster
+colnames(col_scaled_median_RP)[colnames(col_scaled_median_RP)=="24B"] <- "2B4"
+
+row.names(cluster_medians) <- cluster_medians$Cluster
+
+cols = c("#FFFF99","#1F78B4","#FB9A99","#FDBF6F","#B2DF8A","#FF7F00","gray","#EF8A62","#CAB2D6","#E31A1C","#E9A3C9","black","#6A3D9A","#A6CEE3","#B15928", "#33A02C")
+cluster_cols <- cols
+names(cluster_cols) <- keep_clusts
+
+heatmap_anno <- rowAnnotation(Cluster = row.names(col_scaled_median_RP), col=list(Cluster=c(col_scaled_median_RP)))
+
+Heatmap(col_scaled_median_RP[,-1],row_names_side="right",name="Z-score",show_parent_dend_line=F, rect_gp = gpar(col = "white", lwd = 0.1)) #,right_annotation = heatmap_anno)
+```
+
+
+
